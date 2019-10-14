@@ -1,0 +1,799 @@
+From 5a7dc12c8ee1b3eb5f206701eb9e05d00a6989d1 Mon Sep 17 00:00:00 2001
+From: Maxime Beck <maxbeck@redhat.com>
+Date: Mon, 12 Aug 2019 16:51:44 +0200
+Subject: [PATCH] Introduce Tomcat Source-to-Image
+
+---
+ res/tomcat-s2i/Dockerfile              |  60 +++++++
+ res/tomcat-s2i/README.md               |  46 ++++++
+ res/tomcat-s2i/conf/logging.properties |  79 +++++++++
+ res/tomcat-s2i/conf/server.xml         | 120 ++++++++++++++
+ res/tomcat-s2i/conf/tomcat-users.xml   |  44 +++++
+ res/tomcat-s2i/m2/settings.xml         | 214 +++++++++++++++++++++++++
+ res/tomcat-s2i/s2i/bin/assemble        |  66 ++++++++
+ res/tomcat-s2i/s2i/bin/run             |  25 +++
+ res/tomcat-s2i/s2i/bin/save-artifacts  |  26 +++
+ res/tomcat-s2i/s2i/bin/usage           |  28 ++++
+ 10 files changed, 708 insertions(+)
+ create mode 100644 res/tomcat-s2i/Dockerfile
+ create mode 100644 res/tomcat-s2i/README.md
+ create mode 100644 res/tomcat-s2i/conf/logging.properties
+ create mode 100644 res/tomcat-s2i/conf/server.xml
+ create mode 100644 res/tomcat-s2i/conf/tomcat-users.xml
+ create mode 100644 res/tomcat-s2i/m2/settings.xml
+ create mode 100644 res/tomcat-s2i/s2i/bin/assemble
+ create mode 100644 res/tomcat-s2i/s2i/bin/run
+ create mode 100644 res/tomcat-s2i/s2i/bin/save-artifacts
+ create mode 100644 res/tomcat-s2i/s2i/bin/usage
+
+diff --git a/res/tomcat-s2i/Dockerfile b/res/tomcat-s2i/Dockerfile
+new file mode 100644
+index 0000000000..f4d06a2019
+--- /dev/null
++++ b/res/tomcat-s2i/Dockerfile
+@@ -0,0 +1,60 @@
++# Licensed to the Apache Software Foundation (ASF) under one
++# or more contributor license agreements.  See the NOTICE file
++# distributed with this work for additional information
++# regarding copyright ownership.  The ASF licenses this file
++# to you under the Apache License, Version 2.0 (the
++# "License"); you may not use this file except in compliance
++# with the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++FROM openshift/base-centos7
++
++EXPOSE 8080
++
++ENV TOMCAT_VERSION=9.0.22 \
++    MAVEN_VERSION=3.6.1
++
++LABEL io.k8s.description="Platform for building and running JEE applications on Tomcat" \
++      io.k8s.display-name="Tomcat Builder" \
++      io.openshift.expose-services="8080:http" \
++      io.openshift.tags="builder,tomcat" \
++      io.openshift.s2i.destination="/opt/s2i/destination"
++
++# Install Maven, Tomcat 9.0.22
++RUN INSTALL_PKGS="tar java-1.8.0-openjdk java-1.8.0-openjdk-devel" && \
++    yum install -y --enablerepo=centosplus $INSTALL_PKGS && \
++    rpm -V $INSTALL_PKGS && \
++    yum clean all -y && \
++    (curl -v https://www.apache.org/dist/maven/maven-3/$MAVEN_VERSION/binaries/apache-maven-$MAVEN_VERSION-bin.tar.gz | \
++    tar -zx -C /usr/local) && \
++    ln -sf /usr/local/apache-maven-$MAVEN_VERSION/bin/mvn /usr/local/bin/mvn && \
++    mkdir -p $HOME/.m2 && \
++    mkdir -p /tomcat && \
++    (curl -v http://www.apache.org/dist/tomcat/tomcat-9/v$TOMCAT_VERSION/bin/apache-tomcat-$TOMCAT_VERSION.tar.gz | tar -zx --strip-components=1 -C /tomcat) && \
++    rm -rf /tomcat/webapps/* && \
++    mkdir -p /opt/s2i/destination
++
++# Add s2i customizations
++ADD ./m2/settings.xml $HOME/.m2/
++ADD ./conf /tomcat/conf
++
++# Copy the S2I scripts from the specific language image to $STI_SCRIPTS_PATH
++COPY ./s2i/bin/ $STI_SCRIPTS_PATH
++
++RUN chmod -R a+rw /tomcat && \
++    chmod a+rwx /tomcat/* && \
++    chmod +x /tomcat/bin/*.sh && \
++    chmod -R a+rw $HOME && \
++    chmod -R +x $STI_SCRIPTS_PATH && \
++    chmod -R g+rw /opt/s2i/destination
++
++USER 1001
++
++CMD $STI_SCRIPTS_PATH/usage
+\ No newline at end of file
+diff --git a/res/tomcat-s2i/README.md b/res/tomcat-s2i/README.md
+new file mode 100644
+index 0000000000..0f176ed832
+--- /dev/null
++++ b/res/tomcat-s2i/README.md
+@@ -0,0 +1,46 @@
++<!--
++
++    Licensed to the Apache Software Foundation (ASF) under one
++    or more contributor license agreements.  See the NOTICE file
++    distributed with this work for additional information
++    regarding copyright ownership.  The ASF licenses this file
++    to you under the Apache License, Version 2.0 (the
++    "License"); you may not use this file except in compliance
++    with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++    Unless required by applicable law or agreed to in writing,
++    software distributed under the License is distributed on an
++    "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++    KIND, either express or implied.  See the License for the
++    specific language governing permissions and limitations
++    under the License.
++
++-->
++
++# Tomcat - Source-to-Image Builder
++This repository provides a CentOS-based Docker image that enables Source-to-Image (S2I) building for Tomcat. It builds the sources of your webapp and deploys it to a fully functional containerized Tomcat Server. The generated image can then easily be run locally or deployed to your Openshift Server.
++
++## Build the Image
++You can build the Tomcat-S2I Docker image by cloning the present repository and running `docker build`:
++```bash
++$ docker build . -t [IMAGE_BUILDER_TAG]
++```
++Where `[IMAGE_BUILDER_TAG]` is the tag you would like to assign to the tomcat-s2i image builder.
++
++## Usage
++To use the provided image, you'll first need to install [Openshift S2I](https://github.com/openshift/source-to-image#installation). Then simply run the following command:
++```bash
++$ s2i build [SOURCE_URL] [IMAGE_BUILDER_TAG] [IMAGE_TAG]
++```
++Where `[SOURCE_URL]` is either the URL to your Git repository or the path to your local sources and `[IMAGE_TAG]` is simply the tag you would like to assign to the generated image.
++
++Once built, you can run it locally:
++```bash
++$ docker run -p 8080:8080 [IMAGE_TAG]
++```
++Or push it to a Docker Registry for further use on your Openshift Server:
++```bash
++$ docker push [IMAGE_TAG]
++```
+\ No newline at end of file
+diff --git a/res/tomcat-s2i/conf/logging.properties b/res/tomcat-s2i/conf/logging.properties
+new file mode 100644
+index 0000000000..e8b7b16bc4
+--- /dev/null
++++ b/res/tomcat-s2i/conf/logging.properties
+@@ -0,0 +1,79 @@
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.
++# The ASF licenses this file to You under the Apache License, Version 2.0
++# (the "License"); you may not use this file except in compliance with
++# the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++handlers = 1catalina.org.apache.juli.AsyncFileHandler, 2localhost.org.apache.juli.AsyncFileHandler, 3manager.org.apache.juli.AsyncFileHandler, 4host-manager.org.apache.juli.AsyncFileHandler, java.util.logging.ConsoleHandler
++
++.handlers = 1catalina.org.apache.juli.AsyncFileHandler, java.util.logging.ConsoleHandler
++
++############################################################
++# Handler specific properties.
++# Describes specific configuration info for Handlers.
++############################################################
++
++1catalina.org.apache.juli.AsyncFileHandler.level = FINE
++1catalina.org.apache.juli.AsyncFileHandler.directory = ${catalina.base}/logs
++1catalina.org.apache.juli.AsyncFileHandler.prefix = catalina.
++1catalina.org.apache.juli.AsyncFileHandler.maxDays = 90
++1catalina.org.apache.juli.AsyncFileHandler.encoding = UTF-8
++
++2localhost.org.apache.juli.AsyncFileHandler.level = FINE
++2localhost.org.apache.juli.AsyncFileHandler.directory = ${catalina.base}/logs
++2localhost.org.apache.juli.AsyncFileHandler.prefix = localhost.
++2localhost.org.apache.juli.AsyncFileHandler.maxDays = 90
++2localhost.org.apache.juli.AsyncFileHandler.encoding = UTF-8
++
++3manager.org.apache.juli.AsyncFileHandler.level = FINE
++3manager.org.apache.juli.AsyncFileHandler.directory = ${catalina.base}/logs
++3manager.org.apache.juli.AsyncFileHandler.prefix = manager.
++3manager.org.apache.juli.AsyncFileHandler.maxDays = 90
++3manager.org.apache.juli.AsyncFileHandler.encoding = UTF-8
++
++4host-manager.org.apache.juli.AsyncFileHandler.level = FINE
++4host-manager.org.apache.juli.AsyncFileHandler.directory = ${catalina.base}/logs
++4host-manager.org.apache.juli.AsyncFileHandler.prefix = host-manager.
++4host-manager.org.apache.juli.AsyncFileHandler.maxDays = 90
++4host-manager.org.apache.juli.AsyncFileHandler.encoding = UTF-8
++
++java.util.logging.ConsoleHandler.level = FINE
++java.util.logging.ConsoleHandler.formatter = org.apache.juli.OneLineFormatter
++java.util.logging.ConsoleHandler.encoding = UTF-8
++
++
++############################################################
++# Facility specific properties.
++# Provides extra control for each logger.
++############################################################
++
++org.apache.catalina.core.ContainerBase.[Catalina].[localhost].level = INFO
++org.apache.catalina.core.ContainerBase.[Catalina].[localhost].handlers = 2localhost.org.apache.juli.AsyncFileHandler
++
++org.apache.catalina.core.ContainerBase.[Catalina].[localhost].[/manager].level = INFO
++org.apache.catalina.core.ContainerBase.[Catalina].[localhost].[/manager].handlers = 3manager.org.apache.juli.AsyncFileHandler
++
++org.apache.catalina.core.ContainerBase.[Catalina].[localhost].[/host-manager].level = INFO
++org.apache.catalina.core.ContainerBase.[Catalina].[localhost].[/host-manager].handlers = 4host-manager.org.apache.juli.AsyncFileHandler
++
++# For example, set the org.apache.catalina.util.LifecycleBase logger to log
++# each component that extends LifecycleBase changing state:
++#org.apache.catalina.util.LifecycleBase.level = FINE
++
++# To see debug messages in TldLocationsCache, uncomment the following line:
++#org.apache.jasper.compiler.TldLocationsCache.level = FINE
++
++# To see debug messages for HTTP/2 handling, uncomment the following line:
++#org.apache.coyote.http2.level = FINE
++
++# To see debug messages for WebSocket handling, uncomment the following line:
++#org.apache.tomcat.websocket.level = FINE
+diff --git a/res/tomcat-s2i/conf/server.xml b/res/tomcat-s2i/conf/server.xml
+new file mode 100644
+index 0000000000..7c24b18f7b
+--- /dev/null
++++ b/res/tomcat-s2i/conf/server.xml
+@@ -0,0 +1,120 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!--
++  Licensed to the Apache Software Foundation (ASF) under one or more
++  contributor license agreements.  See the NOTICE file distributed with
++  this work for additional information regarding copyright ownership.
++  The ASF licenses this file to You under the Apache License, Version 2.0
++  (the "License"); you may not use this file except in compliance with
++  the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++-->
++<Server port="8005" shutdown="SHUTDOWN">
++  <Listener className="org.apache.catalina.startup.VersionLoggerListener" />
++  <!-- Security listener. Documentation at /docs/config/listeners.html
++  <Listener className="org.apache.catalina.security.SecurityListener" />
++  -->
++  <!-- Prevent memory leaks due to use of particular java/javax APIs-->
++  <Listener className="org.apache.catalina.core.JreMemoryLeakPreventionListener" />
++  <Listener className="org.apache.catalina.mbeans.GlobalResourcesLifecycleListener" />
++  <Listener className="org.apache.catalina.core.ThreadLocalLeakPreventionListener" />
++
++  <!-- Global JNDI resources
++       Documentation at /docs/jndi-resources-howto.html
++  -->
++  <GlobalNamingResources>
++    <!-- Editable user database that can also be used by
++         UserDatabaseRealm to authenticate users
++    -->
++    <Resource name="UserDatabase" auth="Container"
++              type="org.apache.catalina.UserDatabase"
++              description="User database that can be updated and saved"
++              factory="org.apache.catalina.users.MemoryUserDatabaseFactory"
++              pathname="conf/tomcat-users.xml" />
++  </GlobalNamingResources>
++
++  <!-- A "Service" is a collection of one or more "Connectors" that share
++       a single "Container" Note:  A "Service" is not itself a "Container",
++       so you may not define subcomponents such as "Valves" at this level.
++       Documentation at /docs/config/service.html
++   -->
++  <Service name="Catalina">
++
++    <!--The connectors can use a shared executor, you can define one or more named thread pools-->
++    <!--
++    <Executor name="tomcatThreadPool" namePrefix="catalina-exec-"
++        maxThreads="150" minSpareThreads="4"/>
++    -->
++
++
++    <!-- A "Connector" represents an endpoint by which requests are received
++         and responses are returned. Documentation at :
++         Java HTTP Connector: /docs/config/http.html
++         Java AJP  Connector: /docs/config/ajp.html
++         APR (HTTP/AJP) Connector: /docs/apr.html
++         Define a non-SSL/TLS HTTP/1.1 Connector on port 8080
++    -->
++    <Connector port="8080" protocol="HTTP/1.1"
++               connectionTimeout="20000"
++               redirectPort="8443" />
++
++    <!-- An Engine represents the entry point (within Catalina) that processes
++         every request.  The Engine implementation for Tomcat stand alone
++         analyzes the HTTP headers included with the request, and passes them
++         on to the appropriate Host (virtual host).
++         Documentation at /docs/config/engine.html -->
++
++    <!-- You should set jvmRoute to support load-balancing via AJP ie :
++    <Engine name="Catalina" defaultHost="localhost" jvmRoute="jvm1">
++    -->
++    <Engine name="Catalina" defaultHost="localhost">
++
++      <!--For clustering, please take a look at documentation at:
++          /docs/cluster-howto.html  (simple how to)
++          /docs/config/cluster.html (reference documentation) -->
++      <!--
++      <Cluster className="org.apache.catalina.ha.tcp.SimpleTcpCluster"/>
++      -->
++
++      <!-- Use the LockOutRealm to prevent attempts to guess user passwords
++           via a brute-force attack -->
++      <Realm className="org.apache.catalina.realm.LockOutRealm">
++        <!-- This Realm uses the UserDatabase configured in the global JNDI
++             resources under the key "UserDatabase".  Any edits
++             that are performed against this UserDatabase are immediately
++             available for use by the Realm.  -->
++        <Realm className="org.apache.catalina.realm.UserDatabaseRealm"
++               resourceName="UserDatabase"/>
++      </Realm>
++
++      <Host name="localhost"  appBase="webapps"
++            unpackWARs="true" autoDeploy="true">
++
++        <!-- SingleSignOn valve, share authentication between web applications
++             Documentation at: /docs/config/valve.html -->
++        <!--
++        <Valve className="org.apache.catalina.authenticator.SingleSignOn" />
++        -->
++
++        <!-- Access log processes all example.
++             Documentation at: /docs/config/valve.html
++             Note: The pattern used is equivalent to using pattern="common" -->
++        <Valve className="org.apache.catalina.valves.AccessLogValve" directory="logs"
++               prefix="localhost_access_log" suffix=".txt"
++               pattern="%h %l %u %t &quot;%r&quot; %s %b" />
++        <Valve className="org.apache.catalina.valves.HealthCheckValve" path="/health" />
++        <Cluster className="org.apache.catalina.ha.tcp.SimpleTcpCluster">
++          <Channel className="org.apache.catalina.tribes.group.GroupChannel">
++            <Membership className="org.apache.catalina.tribes.membership.cloud.CloudMembershipService" membershipProviderClassName="org.apache.catalina.tribes.membership.cloud.DNSMembershipProvider"/>
++          </Channel>
++        </Cluster>
++      </Host>
++    </Engine>
++  </Service>
++</Server>
+diff --git a/res/tomcat-s2i/conf/tomcat-users.xml b/res/tomcat-s2i/conf/tomcat-users.xml
+new file mode 100644
+index 0000000000..aef66d0f4c
+--- /dev/null
++++ b/res/tomcat-s2i/conf/tomcat-users.xml
+@@ -0,0 +1,44 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!--
++  Licensed to the Apache Software Foundation (ASF) under one or more
++  contributor license agreements.  See the NOTICE file distributed with
++  this work for additional information regarding copyright ownership.
++  The ASF licenses this file to You under the Apache License, Version 2.0
++  (the "License"); you may not use this file except in compliance with
++  the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++-->
++<tomcat-users xmlns="http://tomcat.apache.org/xml"
++              xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++              xsi:schemaLocation="http://tomcat.apache.org/xml tomcat-users.xsd"
++              version="1.0">
++<!--
++  NOTE:  By default, no user is included in the "manager-gui" role required
++  to operate the "/manager/html" web application.  If you wish to use this app,
++  you must define such a user - the username and password are arbitrary. It is
++  strongly recommended that you do NOT use one of the users in the commented out
++  section below since they are intended for use with the examples web
++  application.
++-->
++<!--
++  NOTE:  The sample user and role entries below are intended for use with the
++  examples web application. They are wrapped in a comment and thus are ignored
++  when reading this file. If you wish to configure these users for use with the
++  examples web application, do not forget to remove the <!.. ..> that surrounds
++  them. You will also need to set the passwords to something appropriate.
++-->
++<!--
++  <role rolename="tomcat"/>
++  <role rolename="role1"/>
++  <user username="tomcat" password="<must-be-changed>" roles="tomcat"/>
++  <user username="both" password="<must-be-changed>" roles="tomcat,role1"/>
++  <user username="role1" password="<must-be-changed>" roles="role1"/>
++-->
++</tomcat-users>
+diff --git a/res/tomcat-s2i/m2/settings.xml b/res/tomcat-s2i/m2/settings.xml
+new file mode 100644
+index 0000000000..b31ab577b9
+--- /dev/null
++++ b/res/tomcat-s2i/m2/settings.xml
+@@ -0,0 +1,214 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!--
++
++    Licensed to the Apache Software Foundation (ASF) under one
++    or more contributor license agreements.  See the NOTICE file
++    distributed with this work for additional information
++    regarding copyright ownership.  The ASF licenses this file
++    to you under the Apache License, Version 2.0 (the
++    "License"); you may not use this file except in compliance
++    with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++    Unless required by applicable law or agreed to in writing,
++    software distributed under the License is distributed on an
++    "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++    KIND, either express or implied.  See the License for the
++    specific language governing permissions and limitations
++    under the License.
++
++-->
++<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
++          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++          xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0 http://maven.apache.org/xsd/settings-1.0.0.xsd">
++
++  <mirrors>
++    <!-- ### configured mirrors ### -->
++  </mirrors>
++
++  <proxies>
++    <!-- ### configured http proxy ### -->
++  </proxies>
++
++  <profiles>
++
++    <!-- JBoss EAP Maven repository -->
++    <profile>
++      <id>jboss-eap-repository</id>
++      <activation>
++        <property>
++          <name>com.redhat.xpaas.repo.redhatga</name>
++          <value/>
++        </property>
++      </activation>
++      <repositories>
++        <repository>
++          <id>jboss-eap-repository</id>
++          <url>https://maven.repository.redhat.com/techpreview/all</url>
++          <releases>
++            <enabled>true</enabled>
++          </releases>
++          <snapshots>
++            <enabled>false</enabled>
++          </snapshots>
++        </repository>
++      </repositories>
++      <pluginRepositories>
++        <pluginRepository>
++          <id>jboss-eap-plugin-repository</id>
++          <url>https://maven.repository.redhat.com/techpreview/all</url>
++          <releases>
++            <enabled>true</enabled>
++          </releases>
++          <snapshots>
++            <enabled>false</enabled>
++          </snapshots>
++        </pluginRepository>
++      </pluginRepositories>
++    </profile>
++
++    <!-- JBoss EAP Maven repository (HTTP version, disabled by default) -->
++    <profile>
++      <id>jboss-eap-repository-insecure</id>
++      <repositories>
++        <repository>
++          <id>jboss-eap-repository</id>
++          <url>http://maven.repository.redhat.com/techpreview/all</url>
++          <releases>
++            <enabled>true</enabled>
++          </releases>
++          <snapshots>
++            <enabled>false</enabled>
++          </snapshots>
++        </repository>
++      </repositories>
++      <pluginRepositories>
++        <pluginRepository>
++          <id>jboss-eap-plugin-repository</id>
++          <url>http://maven.repository.redhat.com/techpreview/all</url>
++          <releases>
++            <enabled>true</enabled>
++          </releases>
++          <snapshots>
++            <enabled>false</enabled>
++          </snapshots>
++        </pluginRepository>
++      </pluginRepositories>
++    </profile>
++
++    <!-- JBoss Community Maven repository -->
++    <profile>
++      <id>jboss-community-repository</id>
++      <activation>
++        <property>
++          <name>com.redhat.xpaas.repo.jbossorg</name>
++          <value/>
++        </property>
++      </activation>
++      <repositories>
++        <repository>
++          <id>jboss-community-repository</id>
++          <url>https://repository.jboss.org/nexus/content/groups/public/</url>
++          <releases>
++            <enabled>true</enabled>
++          </releases>
++          <snapshots>
++            <enabled>false</enabled>
++          </snapshots>
++        </repository>
++      </repositories>
++      <pluginRepositories>
++        <pluginRepository>
++          <id>jboss-community-plugin-repository</id>
++          <url>https://repository.jboss.org/nexus/content/groups/public/</url>
++          <releases>
++            <enabled>true</enabled>
++          </releases>
++          <snapshots>
++            <enabled>false</enabled>
++          </snapshots>
++        </pluginRepository>
++      </pluginRepositories>
++    </profile>
++
++    <!-- JBoss Community Maven repository (HTTP version, disabled by default) -->
++    <profile>
++      <id>jboss-community-repository-insecure</id>
++      <repositories>
++        <repository>
++          <id>jboss-community-repository</id>
++          <url>http://repository.jboss.org/nexus/content/groups/public/</url>
++          <releases>
++            <enabled>true</enabled>
++          </releases>
++          <snapshots>
++            <enabled>false</enabled>
++          </snapshots>
++        </repository>
++      </repositories>
++      <pluginRepositories>
++        <pluginRepository>
++          <id>jboss-community-plugin-repository</id>
++          <url>http://repository.jboss.org/nexus/content/groups/public/</url>
++          <releases>
++            <enabled>true</enabled>
++          </releases>
++          <snapshots>
++            <enabled>false</enabled>
++          </snapshots>
++        </pluginRepository>
++      </pluginRepositories>
++    </profile>
++
++    <!-- Override the repository "central" from the Maven Super POM, to set HTTPS by default -->
++    <profile>
++      <id>securecentral</id>
++      <repositories>
++        <repository>
++          <id>central</id>
++          <url>https://repo1.maven.org/maven2</url>
++          <releases>
++            <enabled>true</enabled>
++          </releases>
++        </repository>
++      </repositories>
++      <pluginRepositories>
++        <pluginRepository>
++          <id>central</id>
++          <url>https://repo1.maven.org/maven2</url>
++          <releases>
++            <enabled>true</enabled>
++          </releases>
++        </pluginRepository>
++      </pluginRepositories>
++    </profile>
++
++    <!-- central repositories via HTTP. Disabled by default. -->
++    <profile>
++      <id>insecurecentral</id>
++      <repositories>
++        <repository>
++          <id>central</id>
++          <url>http://repo1.maven.org/maven2</url>
++          <releases>
++            <enabled>true</enabled>
++          </releases>
++        </repository>
++      </repositories>
++      <pluginRepositories>
++        <pluginRepository>
++          <id>central</id>
++          <url>http://repo1.maven.org/maven2</url>
++          <releases>
++            <enabled>true</enabled>
++          </releases>
++        </pluginRepository>
++      </pluginRepositories>
++    </profile>
++
++  </profiles>
++  <activeProfiles>
++    <activeProfile>securecentral</activeProfile>
++  </activeProfiles>
++</settings>
+\ No newline at end of file
+diff --git a/res/tomcat-s2i/s2i/bin/assemble b/res/tomcat-s2i/s2i/bin/assemble
+new file mode 100644
+index 0000000000..9917c2b9ec
+--- /dev/null
++++ b/res/tomcat-s2i/s2i/bin/assemble
+@@ -0,0 +1,66 @@
++# Licensed to the Apache Software Foundation (ASF) under one
++# or more contributor license agreements.  See the NOTICE file
++# distributed with this work for additional information
++# regarding copyright ownership.  The ASF licenses this file
++# to you under the Apache License, Version 2.0 (the
++# "License"); you may not use this file except in compliance
++# with the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++#!/bin/bash -e
++#
++# S2I assemble script for the 's2i-tomcat' image.
++# The 'assemble' script builds your application source so that it is ready to run.
++#
++# For more information refer to the documentation:
++#	https://github.com/openshift/source-to-image/blob/master/docs/builder_image.md
++#
++
++# insert settings for mirrors/repository managers into settings.xml if supplied
++function configure_mirrors() {
++  if [ -n "$MAVEN_MIRROR_URL" ]; then
++    xml="    <mirror>\
++      <id>mirror.default</id>\
++      <url>$MAVEN_MIRROR_URL</url>\
++      <mirrorOf>external:*</mirrorOf>\
++    </mirror>"
++    sed -i "s|<!-- ### configured mirrors ### -->|$xml|" $HOME/.m2/settings.xml
++  fi
++}
++
++# If the 's2i-tomcat' assemble script is executed with the '-h' flag, print the usage.
++if [[ "$1" == "-h" ]]; then
++	exec /usr/libexec/s2i/usage
++fi
++
++# Restore artifacts from the previous build (if they exist).
++#
++if [ "$(ls /opt/s2i/destination/artifacts/ 2>/dev/null)" ]; then
++  echo "---> Restoring build artifacts..."
++  mv /opt/s2i/destination/artifacts/. ./
++fi
++
++echo "---> Installing application source..."
++cp -Rf /opt/s2i/destination/src/. ./
++
++echo "---> Building application from source..."
++# TODO: Add build steps for your application, eg npm install, bundle install, pip install, etc.
++
++configure_mirrors
++
++
++if [ -n "$MAVEN_PROFILE" ]; then
++    mvn package -P$MAVEN_PROFILE -Dmaven.test.skip=true
++else
++    mvn -Dmaven.test.skip=true package
++fi
++
++mv ./target/*.war /tomcat/webapps/
++mvn clean
+diff --git a/res/tomcat-s2i/s2i/bin/run b/res/tomcat-s2i/s2i/bin/run
+new file mode 100644
+index 0000000000..b3872878d0
+--- /dev/null
++++ b/res/tomcat-s2i/s2i/bin/run
+@@ -0,0 +1,25 @@
++# Licensed to the Apache Software Foundation (ASF) under one
++# or more contributor license agreements.  See the NOTICE file
++# distributed with this work for additional information
++# regarding copyright ownership.  The ASF licenses this file
++# to you under the Apache License, Version 2.0 (the
++# "License"); you may not use this file except in compliance
++# with the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++#!/bin/bash -e
++#
++# S2I run script for the 's2i-tomcat' image.
++# The run script executes the server that runs your application.
++#
++# For more information see the documentation:
++#	https://github.com/openshift/source-to-image/blob/master/docs/builder_image.md
++#
++bash -c "/tomcat/bin/catalina.sh run"
+diff --git a/res/tomcat-s2i/s2i/bin/save-artifacts b/res/tomcat-s2i/s2i/bin/save-artifacts
+new file mode 100644
+index 0000000000..3c2ca92226
+--- /dev/null
++++ b/res/tomcat-s2i/s2i/bin/save-artifacts
+@@ -0,0 +1,26 @@
++# Licensed to the Apache Software Foundation (ASF) under one
++# or more contributor license agreements.  See the NOTICE file
++# distributed with this work for additional information
++# regarding copyright ownership.  The ASF licenses this file
++# to you under the Apache License, Version 2.0 (the
++# "License"); you may not use this file except in compliance
++# with the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++#!/bin/sh -e
++#
++# S2I save-artifacts script for the 'tomcat-s2i' image.
++# The save-artifacts script streams a tar archive to standard output.
++# The archive contains the files and folders you want to re-use in the next build.
++#
++# For more information see the documentation:
++#	https://github.com/openshift/source-to-image/blob/master/docs/builder_image.md
++#
++# tar cf - <list of files and folders>
+diff --git a/res/tomcat-s2i/s2i/bin/usage b/res/tomcat-s2i/s2i/bin/usage
+new file mode 100644
+index 0000000000..ed249ca379
+--- /dev/null
++++ b/res/tomcat-s2i/s2i/bin/usage
+@@ -0,0 +1,28 @@
++# Licensed to the Apache Software Foundation (ASF) under one
++# or more contributor license agreements.  See the NOTICE file
++# distributed with this work for additional information
++# regarding copyright ownership.  The ASF licenses this file
++# to you under the Apache License, Version 2.0 (the
++# "License"); you may not use this file except in compliance
++# with the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++#!/bin/bash -e
++cat <<EOF
++This is the s2i-tomcat S2I image:
++To use it, install S2I: https://github.com/openshift/source-to-image
++
++Sample invocation:
++
++s2i build <source code path/URL> tomcat-s2i <application image>
++
++You can then run the resulting image via:
++docker run -p 8080:8080 <application image>
++EOF
